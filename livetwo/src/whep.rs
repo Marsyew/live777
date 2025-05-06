@@ -32,6 +32,8 @@ use crate::rtspclient::setup_rtsp_push_session;
 use crate::utils;
 use crate::{SCHEME_RTP_SDP, SCHEME_RTSP_CLIENT, SCHEME_RTSP_SERVER};
 
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters;
+
 pub async fn from(
     target_url: String,
     whep_url: String,
@@ -307,7 +309,7 @@ async fn new_peer(
                 let mut codec_info = codec_info.lock().await;
                 if track_kind == RTPCodecType::Video {
                     debug!("Updating video codec info: {:?}", codec);
-                    codec_info.video_codec = Some(codec.clone());
+                    codec_info.video_codec = Some(RTCRtpCodecParameters::from(codec.clone()));
                 } else if track_kind == RTPCodecType::Audio {
                     debug!("Updating audio codec info: {:?}", codec);
                     codec_info.audio_codec = Some(codec.clone());
@@ -336,4 +338,161 @@ async fn new_peer(
     }));
 
     Ok(peer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn create_test_sdp() -> String {
+        r#"v=0
+o=- 1234567890 1234567890 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=group:BUNDLE 0 1
+m=video 9 UDP/TLS/RTP/SAVPF 96
+c=IN IP4 127.0.0.1
+a=rtpmap:96 VP8/90000
+a=rtcp-fb:96 nack
+a=rtcp-fb:96 nack pli
+a=rtcp-fb:96 goog-remb
+a=mid:0
+a=sendonly
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+c=IN IP4 127.0.0.1
+a=rtpmap:111 opus/48000/2
+a=mid:1
+a=sendonly"#
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_new_peer() {
+        let (video_send, _) = unbounded_channel::<Vec<u8>>();
+        let (audio_send, _) = unbounded_channel::<Vec<u8>>();
+        let (complete_tx, _) = unbounded_channel();
+        let codec_info = Arc::new(tokio::sync::Mutex::new(rtsp::CodecInfo::new()));
+
+        let peer = new_peer(video_send, audio_send, complete_tx, codec_info.clone()).await;
+
+        assert!(peer.is_ok(), "Failed to create peer connection");
+        let peer = peer.unwrap();
+
+        let transceivers = peer.get_transceivers().await;
+        assert_eq!(transceivers.len(), 2, "Expected two transceivers");
+
+        for transceiver in transceivers {
+            let direction = transceiver.direction();
+            assert_eq!(
+                direction,
+                RTCRtpTransceiverDirection::Recvonly,
+                "Transceiver should be recvonly"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_url() {
+        let target_url = format!("{}://127.0.0.1:8000/test.sdp", SCHEME_RTP_SDP);
+        let input = Url::parse(&target_url).unwrap();
+        let (target_host, _listen_host) = utils::parse_host(&input);
+
+        assert_eq!(
+            target_host, "127.0.0.1",
+            "Target host should be parsed correctly"
+        );
+
+        let target_url = format!("{}://0.0.0.0:8554/stream", SCHEME_RTSP_SERVER);
+        let input = Url::parse(&target_url).unwrap();
+        let (target_host, _listen_host) = utils::parse_host(&input);
+
+        assert_eq!(
+            target_host, "0.0.0.0",
+            "Target host should be parsed correctly for RTSP server"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdp_creation() {
+        let sdp = create_test_sdp();
+
+        assert!(sdp.contains("m=video"), "SDP should contain video media");
+        assert!(sdp.contains("m=audio"), "SDP should contain audio media");
+        assert!(
+            sdp.contains("rtpmap:96 VP8/90000"),
+            "SDP should specify VP8 codec"
+        );
+        assert!(
+            sdp.contains("rtpmap:111 opus/48000/2"),
+            "SDP should specify Opus codec"
+        );
+    }
+
+    #[test]
+    fn test_sdp_filter() {
+        let sdp = create_test_sdp();
+
+        let video_codec = webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters {
+            capability: webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
+                mime_type: "video/VP8".to_string(),
+                clock_rate: 90000,
+                channels: 0,
+                sdp_fmtp_line: "".to_string(),
+                rtcp_feedback: vec![],
+            },
+            payload_type: 96,
+            ..Default::default()
+        };
+
+        let audio_codec = webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters {
+            capability: webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
+                mime_type: "audio/opus".to_string(),
+                clock_rate: 48000,
+                channels: 2,
+                sdp_fmtp_line: "".to_string(),
+                rtcp_feedback: vec![],
+            },
+            payload_type: 111,
+            ..Default::default()
+        };
+
+        let result = rtsp::filter_sdp(&sdp, Some(&video_codec), Some(&audio_codec));
+        assert!(result.is_ok(), "SDP filtering should succeed");
+
+        if let Ok(filtered_sdp) = result {
+            assert!(
+                filtered_sdp.contains("VP8/90000"),
+                "Filtered SDP should contain video codec"
+            );
+            assert!(
+                filtered_sdp.contains("opus/48000"),
+                "Filtered SDP should contain audio codec"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rtsp_url_parsing() {
+        let target_url = format!(
+            "{}://admin:password@192.168.1.100:554/live",
+            SCHEME_RTSP_CLIENT
+        );
+        let url = Url::parse(&target_url).unwrap();
+
+        assert_eq!(url.scheme(), SCHEME_RTSP_CLIENT, "Scheme should be rtsp");
+        assert_eq!(
+            url.host_str().unwrap(),
+            "192.168.1.100",
+            "Host should be parsed correctly"
+        );
+        assert_eq!(url.port().unwrap(), 554, "Port should be parsed correctly");
+        assert_eq!(url.path(), "/live", "Path should be parsed correctly");
+        assert_eq!(
+            url.username(),
+            "admin",
+            "Username should be parsed correctly"
+        );
+        assert!(url.password().is_some(), "Password should be available");
+    }
 }
