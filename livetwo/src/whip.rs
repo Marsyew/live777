@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use scopeguard::defer;
 use tokio::{
     net::{TcpListener, UdpSocket},
-    sync::mpsc::{unbounded_channel, UnboundedSender},
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
 };
 use tracing::{debug, error, info, trace, warn};
 use url::{Host, Url};
@@ -31,10 +31,11 @@ use webrtc::{
 use cli::{codec_from_str, create_child};
 use libwish::Client;
 
+use crate::camera;
 use crate::payload;
 use crate::rtspclient::setup_rtsp_session;
 
-use crate::{PREFIX_LIB, SCHEME_RTP_SDP, SCHEME_RTSP_CLIENT, SCHEME_RTSP_SERVER};
+use crate::{PREFIX_LIB, SCHEME_RAW_VIDEO, SCHEME_RTP_SDP, SCHEME_RTSP_CLIENT, SCHEME_RTSP_SERVER};
 
 pub async fn into(
     target_url: String,
@@ -70,6 +71,7 @@ pub async fn into(
 
     let video_port = input.port().unwrap_or(0);
     let media_info;
+    let mut camera_video_rx: Option<UnboundedReceiver<Vec<u8>>> = None;
 
     let (complete_tx, mut complete_rx) = unbounded_channel();
     let mut client = Client::new(whip_url.clone(), Client::get_auth_header_map(token.clone()));
@@ -113,6 +115,10 @@ pub async fn into(
         media_info = rx.recv().await.unwrap();
     } else if input.scheme() == SCHEME_RTSP_CLIENT {
         media_info = setup_rtsp_session(&target_url).await?;
+    } else if input.scheme() == SCHEME_RAW_VIDEO {
+        let (info, tx) = camera::setup_camera_session(&target_url, &complete_tx).await?;
+        media_info = info;
+        camera_video_rx = Some(tx);
     } else {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let path = Path::new(&target_url);
@@ -200,6 +206,7 @@ pub async fn into(
         media_info.audio_codec.map(|c| c.into()),
         complete_tx.clone(),
         target_url,
+        camera_video_rx,
     )
     .await
     .map_err(|error| anyhow!(format!("[{}] {}", PREFIX_LIB, error)))?;
@@ -346,13 +353,22 @@ async fn webrtc_start(
     audio_codec: Option<RTCRtpCodecCapability>,
     complete_tx: UnboundedSender<()>,
     input: String,
+    camera_video_rx: Option<UnboundedReceiver<Vec<u8>>>,
 ) -> Result<(
     Arc<RTCPeerConnection>,
     Option<UnboundedSender<Vec<u8>>>,
     Option<UnboundedSender<Vec<u8>>>,
 )> {
-    let (peer, video_sender, audio_sender) =
-        new_peer(video_codec, audio_codec, complete_tx.clone(), input).await?;
+    // let (peer, video_sender, audio_sender) =
+    //     new_peer(video_codec, audio_codec, complete_tx.clone(), input).await?;
+    let (peer, video_sender, audio_sender) = new_peer(
+        video_codec,
+        audio_codec,
+        complete_tx.clone(),
+        input,
+        camera_video_rx,
+    )
+    .await?;
     let offer = peer.create_offer(None).await?;
 
     let mut gather_complete = peer.gathering_complete_promise().await;
@@ -375,11 +391,147 @@ async fn webrtc_start(
     Ok((peer, video_sender, audio_sender))
 }
 
+// async fn new_peer(
+//     video_codec: Option<RTCRtpCodecCapability>,
+//     audio_codec: Option<RTCRtpCodecCapability>,
+//     complete_tx: UnboundedSender<()>,
+//     input: String,
+// ) -> Result<(
+//     Arc<RTCPeerConnection>,
+//     Option<UnboundedSender<Vec<u8>>>,
+//     Option<UnboundedSender<Vec<u8>>>,
+// )> {
+//     let mut m = MediaEngine::default();
+//     m.register_default_codecs()?;
+//     let mut registry = Registry::new();
+//     registry = register_default_interceptors(registry, &mut m)?;
+//     let api = APIBuilder::new()
+//         .with_media_engine(m)
+//         .with_interceptor_registry(registry)
+//         .build();
+//     let config = RTCConfiguration {
+//         ice_servers: vec![{
+//             RTCIceServer {
+//                 urls: vec!["stun:stun.l.google.com:19302".to_string()],
+//                 username: "".to_string(),
+//                 credential: "".to_string(),
+//                 credential_type: RTCIceCredentialType::Unspecified,
+//             }
+//         }],
+//         ..Default::default()
+//     };
+
+//     let peer = Arc::new(
+//         api.new_peer_connection(config)
+//             .await
+//             .map_err(|error| anyhow!(format!("{:?}: {}", error, error)))?,
+//     );
+
+//     let pc = peer.clone();
+//     peer.on_peer_connection_state_change(Box::new(move |s| {
+//         let pc = pc.clone();
+//         let complete_tx = complete_tx.clone();
+//         tokio::spawn(async move {
+//             warn!("Connection state changed: {}", s);
+//             match s {
+//                 RTCPeerConnectionState::Failed | RTCPeerConnectionState::Disconnected => {
+//                     let _ = pc.close().await;
+//                 }
+//                 RTCPeerConnectionState::Closed => {
+//                     let _ = complete_tx.send(());
+//                 }
+//                 v => debug!("{}", v),
+//             };
+//         });
+//         Box::pin(async {})
+//     }));
+
+//     let video_tx = if let Some(video_codec) = video_codec {
+//         let video_track_id = format!("{}-video", input);
+//         let video_track = Arc::new(TrackLocalStaticRTP::new(
+//             video_codec.clone(),
+//             video_track_id.to_owned(),
+//             input.to_owned(),
+//         ));
+//         let _ = peer
+//             .add_track(video_track.clone())
+//             .await
+//             .map_err(|error| anyhow!(format!("{:?}: {}", error, error)))?;
+
+//         let (video_tx, mut video_rx) = unbounded_channel::<Vec<u8>>();
+//         tokio::spawn(async move {
+//             debug!("Video codec: {}", video_codec.mime_type);
+//             let mut handler: Box<dyn payload::RePayload + Send> =
+//                 match video_codec.mime_type.as_str() {
+//                     MIME_TYPE_VP8 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type)),
+//                     MIME_TYPE_VP9 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type)),
+//                     MIME_TYPE_H264 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type)),
+//                     _ => Box::new(payload::Forward::new()),
+//                 };
+
+//             while let Some(data) = video_rx.recv().await {
+//                 if let Ok(packet) = Packet::unmarshal(&mut data.as_slice()) {
+//                     trace!("Received video packet: {}", packet);
+//                     for packet in handler.payload(packet) {
+//                         trace!("Sending video packet: {}", packet);
+//                         let _ = video_track.write_rtp(&packet).await;
+//                     }
+//                 }
+//             }
+//         });
+//         Some(video_tx)
+//     } else {
+//         None
+//     };
+
+//     let audio_tx = if let Some(audio_codec) = audio_codec {
+//         let audio_track_id = format!("{}-audio", input);
+//         let audio_track = Arc::new(TrackLocalStaticRTP::new(
+//             audio_codec.clone(),
+//             audio_track_id.to_owned(),
+//             input.to_owned(),
+//         ));
+//         let _ = peer
+//             .add_track(audio_track.clone())
+//             .await
+//             .map_err(|error| anyhow!(format!("{:?}: {}", error, error)))?;
+
+//         let (audio_tx, mut audio_rx) = unbounded_channel::<Vec<u8>>();
+//         tokio::spawn(async move {
+//             debug!("Audio codec: {}", audio_codec.mime_type);
+//             let mut handler: Box<dyn payload::RePayload + Send> =
+//                 match audio_codec.mime_type.as_str() {
+//                     MIME_TYPE_OPUS => {
+//                         Box::new(payload::RePayloadCodec::new(audio_codec.mime_type.clone()))
+//                     }
+//                     _ => Box::new(payload::Forward::new()),
+//                 };
+
+//             while let Some(data) = audio_rx.recv().await {
+//                 if audio_codec.mime_type == MIME_TYPE_G722 {
+//                     let _ = audio_track.write(&data).await;
+//                 } else if let Ok(packet) = Packet::unmarshal(&mut data.as_slice()) {
+//                     trace!("Received audio packet: {}", packet);
+//                     for packet in handler.payload(packet) {
+//                         trace!("Sending audio packet: {}", packet);
+//                         let _ = audio_track.write_rtp(&packet).await;
+//                     }
+//                 }
+//             }
+//         });
+//         Some(audio_tx)
+//     } else {
+//         None
+//     };
+
+//     Ok((peer, video_tx, audio_tx))
+// }
 async fn new_peer(
     video_codec: Option<RTCRtpCodecCapability>,
     audio_codec: Option<RTCRtpCodecCapability>,
     complete_tx: UnboundedSender<()>,
     input: String,
+    mut camera_video_rx: Option<UnboundedReceiver<Vec<u8>>>,
 ) -> Result<(
     Arc<RTCPeerConnection>,
     Option<UnboundedSender<Vec<u8>>>,
@@ -394,28 +546,23 @@ async fn new_peer(
         .with_interceptor_registry(registry)
         .build();
     let config = RTCConfiguration {
-        ice_servers: vec![{
-            RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                username: "".to_string(),
-                credential: "".to_string(),
-                credential_type: RTCIceCredentialType::Unspecified,
-            }
+        ice_servers: vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            username: "".to_string(),
+            credential: "".to_string(),
+            credential_type: RTCIceCredentialType::Unspecified,
         }],
         ..Default::default()
     };
 
-    let peer = Arc::new(
-        api.new_peer_connection(config)
-            .await
-            .map_err(|error| anyhow!(format!("{:?}: {}", error, error)))?,
-    );
+    let peer = Arc::new(api.new_peer_connection(config).await?);
 
     let pc = peer.clone();
+    let complete_tx_clone = complete_tx.clone();
     peer.on_peer_connection_state_change(Box::new(move |s| {
         let pc = pc.clone();
-        let complete_tx = complete_tx.clone();
-        tokio::spawn(async move {
+        let complete_tx = complete_tx_clone.clone();
+        Box::pin(async move {
             warn!("Connection state changed: {}", s);
             match s {
                 RTCPeerConnectionState::Failed | RTCPeerConnectionState::Disconnected => {
@@ -425,83 +572,98 @@ async fn new_peer(
                     let _ = complete_tx.send(());
                 }
                 v => debug!("{}", v),
-            };
-        });
-        Box::pin(async {})
+            }
+        })
     }));
 
     let video_tx = if let Some(video_codec) = video_codec {
-        let video_track_id = format!("{}-video", input);
         let video_track = Arc::new(TrackLocalStaticRTP::new(
             video_codec.clone(),
-            video_track_id.to_owned(),
-            input.to_owned(),
+            format!("{}-video", input),
+            input.clone(),
         ));
-        let _ = peer
-            .add_track(video_track.clone())
-            .await
-            .map_err(|error| anyhow!(format!("{:?}: {}", error, error)))?;
+        peer.add_track(video_track.clone()).await?;
 
         let (video_tx, mut video_rx) = unbounded_channel::<Vec<u8>>();
+
         tokio::spawn(async move {
             debug!("Video codec: {}", video_codec.mime_type);
             let mut handler: Box<dyn payload::RePayload + Send> =
                 match video_codec.mime_type.as_str() {
-                    MIME_TYPE_VP8 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type)),
-                    MIME_TYPE_VP9 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type)),
-                    MIME_TYPE_H264 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type)),
+                    camera::MIME_TYPE_AV1 => Box::new(payload::RePayloadCodec::new(
+                        video_codec.mime_type.clone(),
+                    )), // AV1 使用 RePayloadCodec
+                    MIME_TYPE_VP8 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type.clone())),
+                    MIME_TYPE_VP9 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type.clone())),
+                    MIME_TYPE_H264 => Box::new(payload::RePayloadCodec::new(video_codec.mime_type.clone())),
                     _ => Box::new(payload::Forward::new()),
                 };
 
-            while let Some(data) = video_rx.recv().await {
-                if let Ok(packet) = Packet::unmarshal(&mut data.as_slice()) {
-                    trace!("Received video packet: {}", packet);
-                    for packet in handler.payload(packet) {
-                        trace!("Sending video packet: {}", packet);
-                        let _ = video_track.write_rtp(&packet).await;
+            loop {
+                tokio::select! {
+                    Some(data) = async {
+                        if let Some(rx) = camera_video_rx.as_mut() {
+                            rx.recv().await 
+                        } else {
+                            video_rx.recv().await 
+                        }
+                    } => {
+                        trace!("Received video data, size: {}", data.len());
+                        if let Ok(packet) = Packet::unmarshal(&mut &data[..]) {
+                            trace!("Received video packet: {}", packet);
+                            for packet in handler.payload(packet) {
+                                trace!("Sending video packet: {}", packet);
+                                if let Err(e) = video_track.write_rtp(&packet).await {
+                                    error!("Failed to write RTP packet: {}", e);
+                                }
+                            }
+                        }
                     }
+                    else => break, 
                 }
             }
+            debug!("Video processing task ended");
         });
+
         Some(video_tx)
     } else {
         None
     };
 
     let audio_tx = if let Some(audio_codec) = audio_codec {
-        let audio_track_id = format!("{}-audio", input);
         let audio_track = Arc::new(TrackLocalStaticRTP::new(
             audio_codec.clone(),
-            audio_track_id.to_owned(),
-            input.to_owned(),
+            format!("{}-audio", input),
+            input.clone(),
         ));
-        let _ = peer
-            .add_track(audio_track.clone())
-            .await
-            .map_err(|error| anyhow!(format!("{:?}: {}", error, error)))?;
+        peer.add_track(audio_track.clone()).await?;
 
         let (audio_tx, mut audio_rx) = unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
             debug!("Audio codec: {}", audio_codec.mime_type);
             let mut handler: Box<dyn payload::RePayload + Send> =
                 match audio_codec.mime_type.as_str() {
-                    MIME_TYPE_OPUS => {
-                        Box::new(payload::RePayloadCodec::new(audio_codec.mime_type.clone()))
-                    }
+                    MIME_TYPE_OPUS => Box::new(payload::RePayloadCodec::new(audio_codec.mime_type.clone())),
                     _ => Box::new(payload::Forward::new()),
                 };
 
             while let Some(data) = audio_rx.recv().await {
+                trace!("Received audio data, size: {}", data.len());
                 if audio_codec.mime_type == MIME_TYPE_G722 {
-                    let _ = audio_track.write(&data).await;
-                } else if let Ok(packet) = Packet::unmarshal(&mut data.as_slice()) {
+                    if let Err(e) = audio_track.write(&data).await {
+                        error!("Failed to write audio data: {}", e);
+                    }
+                } else if let Ok(packet) = Packet::unmarshal(&mut &data[..]) {
                     trace!("Received audio packet: {}", packet);
                     for packet in handler.payload(packet) {
                         trace!("Sending audio packet: {}", packet);
-                        let _ = audio_track.write_rtp(&packet).await;
+                        if let Err(e) = audio_track.write_rtp(&packet).await {
+                            error!("Failed to write RTP packet: {}", e);
+                        }
                     }
                 }
             }
+            debug!("Audio processing task ended");
         });
         Some(audio_tx)
     } else {
