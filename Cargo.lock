@@ -2756,7 +2756,7 @@ dependencies = [
  "cli",
  "portpicker",
  "rtsp-types",
- "sdp 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sdp 0.8.0",
  "sdp-types",
  "tokio",
  "tracing",
@@ -3064,18 +3064,6 @@ dependencies = [
 [[package]]
 name = "sdp"
 version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13254db766b17451aced321e7397ebf0a446ef0c8d2942b6e67a95815421093f"
-dependencies = [
- "rand",
- "substring",
- "thiserror",
- "url",
-]
-
-[[package]]
-name = "sdp"
-version = "0.6.2"
 source = "git+https://github.com/webrtc-rs/webrtc?rev=ae93e81#ae93e81a493c004b0270603d539ad9a40b7b3064"
 dependencies = [
  "rand",
@@ -3089,6 +3077,18 @@ name = "sdp"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02a526161f474ae94b966ba622379d939a8fe46c930eebbadb73e339622599d5"
+dependencies = [
+ "rand",
+ "substring",
+ "thiserror",
+ "url",
+]
+
+[[package]]
+name = "sdp"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd277015eada44a0bb810a4b84d3bf6e810573fa62fb442f457edf6a1087a69"
 dependencies = [
  "rand",
  "substring",
@@ -4181,7 +4181,7 @@ dependencies = [
  "rtcp",
  "rtp",
  "rustls 0.23.10",
- "sdp 0.6.2 (git+https://github.com/webrtc-rs/webrtc?rev=ae93e81)",
+ "sdp 0.6.2",
  "serde",
  "serde_json",
  "sha2",

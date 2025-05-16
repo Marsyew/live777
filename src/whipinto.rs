@@ -34,7 +34,7 @@ async fn main() {
             1 => Level::INFO,
             2 => Level::DEBUG,
             _ => Level::TRACE,
-        }
+        },
     ));
 
     livetwo::whip::into(
