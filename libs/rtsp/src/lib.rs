@@ -615,17 +615,18 @@ pub async fn process_socket(socket: TcpStream, handler: &mut Handler) -> Result<
     let writer_clone = writer.clone();
     let _writer_task = tokio::spawn(async move {
         loop {
-            let mut rx_guard = interleaved_rx.lock().await; 
+            let mut rx_guard = interleaved_rx.lock().await;
             match rx_guard.recv().await {
                 // Call recv on the UnboundedReceiver
                 Some((channel, data)) => {
-                    trace!(
+                    debug!(
                         "Sending interleaved frame on channel {}, {} bytes",
                         channel,
                         data.len()
                     );
                     let mut writer_guard = writer_clone.lock().await;
-                    if let Err(e) = send_interleaved_frame(&mut *writer_guard, channel, &data).await {
+                    if let Err(e) = send_interleaved_frame(&mut *writer_guard, channel, &data).await
+                    {
                         error!("Failed to send interleaved frame: {}", e);
                         break;
                     }
@@ -663,7 +664,6 @@ pub async fn process_socket(socket: TcpStream, handler: &mut Handler) -> Result<
                     //     }
                     //     accumulated_buf.drain(..4 + len);
                     // }
-                    // 将交错帧发送到WHIP（用于WHIP场景）
                     if let Some(tx) = &handler.interleaved_tx {
                         if let Ok(tx_guard) = tx.try_lock() {
                             if let Err(e) = tx_guard.send((channel, rtp_data.clone())) {
@@ -824,4 +824,3 @@ pub fn filter_sdp(
 
     Ok(session.marshal())
 }
-

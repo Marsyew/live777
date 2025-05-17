@@ -12,12 +12,13 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::net::TcpListener;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Notify;
+use tokio::{net::TcpListener, sync::mpsc::UnboundedReceiver};
 use tracing::{debug, error, info, trace, warn};
 use webrtc::{
-    api::interceptor_registry, peer_connection::sdp::session_description::RTCSessionDescription,
+    api::interceptor_registry,
+    peer_connection::{policy::rtcp_mux_policy, sdp::session_description::RTCSessionDescription},
 };
 use webrtc::{
     peer_connection::RTCPeerConnection,
@@ -146,10 +147,10 @@ pub async fn from(
     //     ),
     //     _ => rtp_mode(filtered_sdp, &target_url, notify.clone()).await?,
     // };
-    let (media_info, new_target_host, interleaved_tx) = match input.scheme() {
+    let (media_info, new_target_host, interleaved_tx, rtcp_interleaved_rx) = match input.scheme() {
         SCHEME_RTSP_SERVER => {
             let tcp_port = input.port().unwrap_or(0);
-            let (media_info, interleaved_tx) = rtsp_server_mode(
+            let (media_info, interleaved_tx, rtcp_interleaved_rx) = rtsp_server_mode(
                 filtered_sdp,
                 &listen_host,
                 complete_tx.clone(),
@@ -157,19 +158,18 @@ pub async fn from(
                 notify,
             )
             .await?;
-            (media_info, target_host, interleaved_tx)
+            (media_info, target_host, interleaved_tx, rtcp_interleaved_rx)
         }
         SCHEME_RTSP_CLIENT => {
             let media_info = rtsp_client_mode(filtered_sdp, &target_url, &target_host).await?;
-            (media_info, target_host, None)
+            (media_info, target_host, None, None)
         }
         _ => {
             let (media_info, host) = rtp_mode(filtered_sdp, &target_url, notify.clone()).await?;
-            (media_info, host, None)
+            (media_info, host, None, None)
         }
     };
 
-    // 更新target_host
     let target_host = new_target_host;
 
     info!("media info : {:?}", media_info);
@@ -181,6 +181,7 @@ pub async fn from(
         &media_info,
         peer.clone(),
         interleaved_tx,
+        rtcp_interleaved_rx,
     );
 
     tokio::select! {
@@ -201,6 +202,7 @@ fn setup_rtp_handlers(
     media_info: &rtsp::MediaInfo,
     peer: Arc<RTCPeerConnection>,
     interleaved_tx: Option<UnboundedSender<(u8, Vec<u8>)>>,
+    rtcp_interleaved_rx: Option<UnboundedReceiver<(u8, Vec<u8>)>>,
 ) {
     if interleaved_tx.is_some() {
         let tx = interleaved_tx.unwrap();
@@ -336,6 +338,42 @@ fn setup_rtp_handlers(
                 }
             });
         }
+        if let Some(mut rx) = rtcp_interleaved_rx {
+            let peer_clone = peer.clone();
+            tokio::spawn(async move {
+                info!("[WHEP] Starting RTCP receiver from RTSP client");
+
+                while let Some((channel, data)) = rx.recv().await {
+                    debug!(
+                        "Received RTCP data from RTSP client on channel {}, {} bytes",
+                        channel,
+                        data.len()
+                    );
+
+                    let mut cursor = Cursor::new(data.clone());
+                    match webrtc::rtcp::packet::unmarshal(&mut cursor) {
+                        Ok(packets) => {
+                            trace!("Successfully parsed {} RTCP packets", packets.len());
+
+                            // 发送 RTCP 包到 WebRTC 连接
+                            if let Err(e) = peer_clone.write_rtcp(&packets).await {
+                                error!("Failed to write RTCP packets to WebRTC: {}", e);
+                            } else {
+                                trace!(
+                                    "Successfully forwarded {} RTCP packets to WebRTC",
+                                    packets.len()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse RTCP packet: {}", e);
+                        }
+                    }
+                }
+
+                warn!("[WHEP] RTCP receiver from RTSP client stopped");
+            });
+        }
     } else {
         let video_recv = video_recv;
         let audio_recv = audio_recv;
@@ -395,11 +433,17 @@ async fn rtsp_server_mode(
     complete_tx: UnboundedSender<()>,
     tcp_port: u16,
     notify: Arc<Notify>,
-) -> Result<(rtsp::MediaInfo, Option<UnboundedSender<(u8, Vec<u8>)>>)> {
+) -> Result<(
+    rtsp::MediaInfo,
+    Option<UnboundedSender<(u8, Vec<u8>)>>,
+    Option<UnboundedReceiver<(u8, Vec<u8>)>>,
+)> {
     let (tx, mut rx) = unbounded_channel::<rtsp::MediaInfo>();
     let (interleaved_tx, interleaved_rx) = unbounded_channel::<(u8, Vec<u8>)>();
+    let (rtcp_interleaved_tx, rtcp_interleaved_rx) = unbounded_channel::<(u8, Vec<u8>)>();
     let mut handler = rtsp::Handler::new(tx, complete_tx);
     handler.set_interleaved_receiver(interleaved_rx);
+    handler.set_interleaved_sender(rtcp_interleaved_tx);
     handler.set_sdp(filtered_sdp.into_bytes());
 
     let host2 = listen_host.to_string();
@@ -436,9 +480,9 @@ async fn rtsp_server_mode(
             .map_or(false, |t| matches!(t, rtsp::TransportInfo::Tcp { .. }));
 
     if uses_tcp {
-        Ok((media_info, Some(interleaved_tx)))
+        Ok((media_info, Some(interleaved_tx), Some(rtcp_interleaved_rx)))
     } else {
-        Ok((media_info, None))
+        Ok((media_info, None, None))
     }
 
     //Ok(rx.recv().await.unwrap())

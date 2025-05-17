@@ -28,13 +28,19 @@ async fn main() {
     let args = Args::parse();
 
     log::set(format!(
-        "livetwo={},webrtc=error",
+        "livetwo={},rtsp{},webrtc=error",
         match args.verbose {
             0 => Level::WARN,
             1 => Level::INFO,
             2 => Level::DEBUG,
             _ => Level::TRACE,
         },
+        match args.verbose {
+            0 => Level::WARN,
+            1 => Level::INFO,
+            2 => Level::DEBUG,
+            _ => Level::TRACE,
+        }
     ));
 
     livetwo::whip::into(

@@ -79,7 +79,7 @@ pub async fn setup_webrtc_connection(
     client: &mut Client,
 ) -> Result<RTCSessionDescription> {
     let offer = peer.create_offer(None).await?;
-    debug!("[UTILS] WebRTC offer created:{:?}", offer);
+    //debug!("[UTILS] WebRTC offer created:{:?}", offer);
 
     let mut gather_complete = peer.gathering_complete_promise().await;
     peer.set_local_description(offer).await?;

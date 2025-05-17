@@ -53,10 +53,6 @@ pub async fn into(
     debug!("[WHIP] Parsed port from input URL: {}", video_port);
 
     let (complete_tx, mut complete_rx) = unbounded_channel();
-    let (tcp_tx, mut tcp_rx): (
-        UnboundedSender<(u8, Vec<u8>)>,
-        UnboundedReceiver<(u8, Vec<u8>)>,
-    ) = unbounded_channel();
     let mut client = Client::new(whip_url.clone(), Client::get_auth_header_map(token.clone()));
     debug!("[WHIP] WHIP client created");
 
@@ -82,16 +78,17 @@ pub async fn into(
     //     _ => rtp_mode(&target_url, &mut listen_host).await?,
     // };
     // info!("[WHIP] Media info: {:?}", media_info);
-    let (media_info, interleaved_rx) = match input.scheme() {
+    let (media_info, interleaved_rx, rtcp_interleaved_tx) = match input.scheme() {
         SCHEME_RTSP_SERVER => {
             rtsp_server_mode(video_port, &listen_host, complete_tx.clone()).await?
         }
-        // SCHEME_RTSP_CLIENT => {
-        //     rtsp_client_mode(&target_url).await?
-        // }
+        SCHEME_RTSP_CLIENT => {
+            let media_info = rtsp_client_mode(&target_url).await?;
+            (media_info, None, None)
+        }
         _ => {
             let media_info = rtp_mode(&target_url, &mut listen_host).await?;
-            (media_info, None)
+            (media_info, None, None)
         }
     };
     info!("[WHIP] Media info: {:?}", media_info);
@@ -104,6 +101,7 @@ pub async fn into(
         &listen_host,
         &target_host,
         interleaved_rx,
+        rtcp_interleaved_tx,
     )
     .await?;
 
@@ -121,14 +119,20 @@ async fn rtsp_server_mode(
     video_port: u16,
     listen_host: &str,
     complete_tx: UnboundedSender<()>,
-) -> Result<(rtsp::MediaInfo, Option<UnboundedReceiver<(u8, Vec<u8>)>>)> {
+) -> Result<(
+    rtsp::MediaInfo,
+    Option<UnboundedReceiver<(u8, Vec<u8>)>>,
+    Option<UnboundedSender<(u8, Vec<u8>)>>,
+)> {
     info!("[WHIP] Starting RTSP server mode");
     let (tx, mut rx) = unbounded_channel::<rtsp::MediaInfo>();
 
     let (interleaved_tx, interleaved_rx) = unbounded_channel::<(u8, Vec<u8>)>();
+    let (rtcp_interleaved_tx, rtcp_interleaved_rx) = unbounded_channel::<(u8, Vec<u8>)>();
     let mut handler = rtsp::Handler::new(tx, complete_tx);
 
     handler.set_interleaved_sender(interleaved_tx);
+    handler.set_interleaved_receiver(rtcp_interleaved_rx);
 
     let host2 = listen_host.to_string();
     debug!("[WHIP] Binding RTSP server to {}:{}", host2, video_port);
@@ -162,9 +166,9 @@ async fn rtsp_server_mode(
             .map_or(false, |t| matches!(t, rtsp::TransportInfo::Tcp { .. }));
 
     if uses_tcp {
-        Ok((media_info, Some(interleaved_rx)))
+        Ok((media_info, Some(interleaved_rx), Some(rtcp_interleaved_tx)))
     } else {
-        Ok((media_info, None))
+        Ok((media_info, None, None))
     }
 
     //Ok(rx.recv().await.unwrap())
@@ -330,6 +334,7 @@ async fn setup_rtp_handlers(
     listen_host: &str,
     target_host: &str,
     interleaved_rx: Option<UnboundedReceiver<(u8, Vec<u8>)>>,
+    rtcp_interleaved_tx: Option<UnboundedSender<(u8, Vec<u8>)>>,
 ) -> Result<Arc<RTCPeerConnection>> {
     let (video_listener, audio_listener) = setup_rtp_listeners(media_info, listen_host).await?;
 
@@ -444,132 +449,90 @@ async fn setup_rtp_handlers(
             warn!("[WHIP] TCP interleaved data handler stopped");
         });
 
-        //     let (rtcp_writer_tx, mut rtcp_writer_rx) = unbounded_channel::<(u8, Vec<u8>)>();
+        if let Some(rtcp_tx) = rtcp_interleaved_tx {
+            let senders = peer.get_senders().await;
 
-        //     // 获取RTCPeerConnection的senders，用于读取RTCP数据
-        //     let senders = peer.get_senders().await;
+            if let Some(rtcp_channel) = video_rtcp_channel {
+                for sender in &senders {
+                    let sender_clone = sender.clone();
+                    if let Some(track) = sender.track().await {
+                        if track.kind() == RTPCodecType::Video {
+                            let rtcp_tx_clone = rtcp_tx.clone();
+                            let channel = rtcp_channel;
 
-        //     // 处理视频RTCP
-        //     if let Some(video_rtcp_channel) = video_rtcp_channel {
-        //         for sender in &senders {
-        //             if let Some(track) = sender.track().await {
-        //                 if track.kind() == RTPCodecType::Video {
-        //                     let rtcp_writer_tx_clone = rtcp_writer_tx.clone();
-        //                     let channel = video_rtcp_channel;
+                            tokio::spawn(async move {
+                                info!("[WHIP] Starting video RTCP reader for sending to RTSP client on channel {}", channel);
 
-        //                     tokio::spawn(async move {
-        //                         info!(
-        //                             "[WHIP] Starting video RTCP reader for TCP mode on channel {}",
-        //                             channel
-        //                         );
+                                loop {
+                                    match sender_clone.read_rtcp().await {
+                                        Ok((packets, _)) => {
+                                            for packet in packets {
+                                                debug!("Received video RTCP from WebRTC to forward to RTSP client: {:?}", packet);
 
-        //                         loop {
-        //                             match sender.read_rtcp().await {
-        //                                 Ok((packets, _)) => {
-        //                                     for packet in packets {
-        //                                         debug!("Received video RTCP from WebRTC: {:?}", packet);
+                                                if let Ok(data) = packet.marshal() {
+                                                    let data_vec = data.to_vec();
+                                                    if let Err(e) =
+                                                        rtcp_tx_clone.send((channel, data_vec))
+                                                    {
+                                                        error!("Failed to forward WebRTC video RTCP to RTSP client: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Error reading video RTCP from WebRTC: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
 
-        //                                         // 序列化RTCP包
-        //                                         if let Ok(data) = packet.marshal() {
-        //                                             // 发送到通道，将在另一个任务中发送回RTSP客户端
-        //                                             if let Err(e) =
-        //                                                 rtcp_writer_tx_clone.send((channel, data))
-        //                                             {
-        //                                                 error!(
-        //                                                     "Failed to forward WebRTC video RTCP: {}",
-        //                                                     e
-        //                                                 );
-        //                                             }
-        //                                         }
-        //                                     }
-        //                                 }
-        //                                 Err(e) => {
-        //                                     warn!("Error reading video RTCP from WebRTC: {}", e);
-        //                                     break;
-        //                                 }
-        //                             }
-        //                         }
-        //                     });
-        //                 }
-        //             }
-        //         }
-        //     }
+            // 处理音频 RTCP
+            if let Some(rtcp_channel) = audio_rtcp_channel {
+                for sender in &senders {
+                    let sender_clone = sender.clone();
+                    if let Some(track) = sender.track().await {
+                        if track.kind() == RTPCodecType::Audio {
+                            let rtcp_tx_clone = rtcp_tx.clone();
+                            let channel = rtcp_channel;
 
-        //     // 处理音频RTCP
-        //     if let Some(audio_rtcp_channel) = audio_rtcp_channel {
-        //         for sender in &senders {
-        //             if let Some(track) = sender.track().await {
-        //                 if track.kind() == RTPCodecType::Audio {
-        //                     let rtcp_writer_tx_clone = rtcp_writer_tx.clone();
-        //                     let channel = audio_rtcp_channel;
+                            tokio::spawn(async move {
+                                info!("[WHIP] Starting audio RTCP reader for sending to RTSP client on channel {}", channel);
 
-        //                     tokio::spawn(async move {
-        //                         info!(
-        //                             "[WHIP] Starting audio RTCP reader for TCP mode on channel {}",
-        //                             channel
-        //                         );
+                                loop {
+                                    match sender_clone.read_rtcp().await {
+                                        Ok((packets, _)) => {
+                                            for packet in packets {
+                                                debug!("Received audio RTCP from WebRTC to forward to RTSP client: {:?}", packet);
 
-        //                         loop {
-        //                             match sender.read_rtcp().await {
-        //                                 Ok((packets, _)) => {
-        //                                     for packet in packets {
-        //                                         debug!("Received audio RTCP from WebRTC: {:?}", packet);
-
-        //                                         // 序列化RTCP包
-        //                                         if let Ok(data) = packet.marshal() {
-        //                                             // 发送到通道，将在另一个任务中发送回RTSP客户端
-        //                                             if let Err(e) =
-        //                                                 rtcp_writer_tx_clone.send((channel, data))
-        //                                             {
-        //                                                 error!(
-        //                                                     "Failed to forward WebRTC audio RTCP: {}",
-        //                                                     e
-        //                                                 );
-        //                                             }
-        //                                         }
-        //                                     }
-        //                                 }
-        //                                 Err(e) => {
-        //                                     warn!("Error reading audio RTCP from WebRTC: {}", e);
-        //                                     break;
-        //                                 }
-        //                             }
-        //                         }
-        //                     });
-        //                 }
-        //             }
-        //         }
-        //     }
-
-        //     // 监听RTCP发送请求，发送数据回RTSP客户端
-        //     // 需要访问RTSP处理程序以发送数据
-        //     tokio::spawn(async move {
-        //         info!("[WHIP] Starting RTCP sender for TCP mode");
-
-        //         while let Some((channel, data)) = rtcp_writer_rx.recv().await {
-        //             trace!(
-        //                 "Sending RTCP data to RTSP client on channel {}, {} bytes",
-        //                 channel,
-        //                 data.len()
-        //             );
-
-        //             // 使用process_socket函数中的writer发送交错帧
-        //             // 这里需要一个机制来访问正确的TCP流
-        //             // 最简单的方法是使用一个全局变量或状态来存储当前的TCP写入器
-        //             if let Some(writer) = rtsp::get_current_tcp_writer() {
-        //                 if let Err(e) =
-        //                     rtsp::send_interleaved_frame(&mut *writer.lock().await, channel, &data)
-        //                         .await
-        //                 {
-        //                     error!("Failed to send RTCP data to RTSP client: {}", e);
-        //                 }
-        //             } else {
-        //                 warn!("No TCP writer available to send RTCP data");
-        //             }
-        //         }
-
-        //         warn!("[WHIP] RTCP sender for TCP mode stopped");
-        //     });
+                                                // 序列化 RTCP 包
+                                                if let Ok(data) = packet.marshal() {
+                                                    let data_vec = data.to_vec();
+                                                    // 发送到通道，将发送到 RTSP 客户端
+                                                    if let Err(e) =
+                                                        rtcp_tx_clone.send((channel, data_vec))
+                                                    {
+                                                        error!("Failed to forward WebRTC audio RTCP to RTSP client: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Error reading audio RTCP from WebRTC: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if let Some(video_listener) = video_listener {
