@@ -1,0 +1,21 @@
+
+[http]
+listen = "0.0.0.0:9999"
+
+[log]
+level = "trace"
+
+[[cameras]]
+id = "camera" 
+rtp_port = 5004 
+
+[cameras.codec]
+mime_type = "video/H264"
+clock_rate = 90000
+channels = 0
+sdp_fmtp_line = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+
+[auth]
+username = "admin"
+#password = "livecam"
+password_hash = "$argon2id$v=19$m=65536,t=3,p=4$Oy2ha+TEEqepOLmRF5zZEA$BOOqmgmGhxCfHI5YvgRCVSRxmUQ5gR/ZYCeEnAZ+SiU"
